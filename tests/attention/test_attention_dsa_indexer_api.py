@@ -1920,6 +1920,20 @@ def test_mxfp4_caps_reject_unqualified_topk(topk: int) -> None:
             topk=topk, cache_format="mxfp4",
         )
 
+@pytest.mark.parametrize("topk", [1024, 2048])
+def test_mxfp4_public_plan_carries_qualified_and_experimental_topk(topk: int) -> None:
+    caps = dsa_indexer.Caps(
+        device="cpu", num_q_heads=4, max_q_rows=2, max_page_table_width=4,
+        topk=topk, cache_format="mxfp4",
+    )
+    declaration = dsa_indexer.plan(
+        caps,
+        invocation=dsa_indexer.invocation_from_tensors(
+            caps, **_public_dsa_inputs(topk=topk)
+        ),
+    )
+    assert declaration.query.top_k == topk
+
 
 def _mxfp4_query(topk: int):
     from b12x.attention.dsa_indexer._tuning import DsaIndexerQuery
