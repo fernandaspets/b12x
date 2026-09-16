@@ -74,7 +74,9 @@ class Caps:
         if self.output_index_space != "logical" or self.topk not in (512, 1024, 2048):
             # 512 is the only qualified width; 1024/2048 are experimental.
             # run_paged_supertile_logits_kernel takes the top-k as a runtime
-            # value and the paged gather uses min(top-k, width).
+            # value, _gather_shared_paged_supertile_kernel gathers the paged
+            # supertile, and B12XAttentionArena._make_workspace_views clamps
+            # the requested top-k to caps.indexer_topk.
             raise ValueError(
                 "MXFP4 requires logical top-k of 512 (qualified) or "
                 f"1024/2048 (experimental); got topk={self.topk}"
