@@ -87,8 +87,14 @@ def _validate_query(query: DsaIndexerQuery, _device: DeviceIdentity | None) -> N
     if query.cache_format not in ("fp8", "mxfp4"):
         raise ValueError("unsupported DSA cache format")
     if query.cache_format == "mxfp4":
-        if query.top_k != 512 or query.page_size <= 0:
-            raise ValueError("MXFP4 requires logical top-k=512 and a positive page size")
+        if query.top_k not in (512, 1024, 2048) or query.page_size <= 0:
+            # Same qualification boundary as Caps: 512 qualified,
+            # 1024/2048 experimental and unqualified.
+            raise ValueError(
+                "MXFP4 requires logical top-k of 512 (qualified) or "
+                f"1024/2048 (experimental) and a positive page size; "
+                f"got top_k={query.top_k}"
+            )
         if query.num_q_heads > 32 or 32 % query.num_q_heads:
             raise ValueError("MXFP4 index heads must divide 32")
         if query.max_candidates and query.candidate_topk_blocks:
