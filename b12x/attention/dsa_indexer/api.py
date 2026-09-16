@@ -71,8 +71,14 @@ class Caps:
                 raise ValueError("FP8 indexer does not support MXFP4 candidate routes")
             return
         index_mxfp4_page_bytes(self.page_size)
-        if self.output_index_space != "logical" or self.topk != 512:
-            raise ValueError("MXFP4 requires logical topk=512 output")
+        if self.output_index_space != "logical" or self.topk not in (512, 1024, 2048):
+            # 512 is the only qualified width; 1024/2048 are experimental.
+            # run_paged_supertile_logits_kernel takes the top-k as a runtime
+            # value and the paged gather uses min(top-k, width).
+            raise ValueError(
+                "MXFP4 requires logical top-k of 512 (qualified) or "
+                f"1024/2048 (experimental); got topk={self.topk}"
+            )
         if self.num_q_heads > 32 or 32 % self.num_q_heads:
             raise ValueError("MXFP4 index heads must divide 32")
         if not 0 <= self.max_candidates <= 16384:
