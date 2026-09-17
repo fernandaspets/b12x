@@ -73,10 +73,10 @@ class Caps:
         index_mxfp4_page_bytes(self.page_size)
         if self.output_index_space != "logical" or self.topk not in (512, 1024, 2048):
             # 512 is the only qualified width; 1024/2048 are experimental.
-            # run_paged_supertile_logits_kernel takes the top-k as a runtime
-            # value, _gather_shared_paged_supertile_kernel gathers the paged
-            # supertile, and B12XAttentionArena._make_workspace_views clamps
-            # the requested top-k to caps.indexer_topk.
+            # The width is caller-declared capacity, not a kernel constant:
+            # plan_mxfp4 sizes the candidate buffers from caps.topk and the
+            # selectors take the top-k as a runtime value, clamping it to the
+            # row width (msa_topk_blocks, _reference_topk_indices_from_logits).
             raise ValueError(
                 "MXFP4 requires logical top-k of 512 (qualified) or "
                 f"1024/2048 (experimental); got topk={self.topk}"
