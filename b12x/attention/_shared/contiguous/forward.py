@@ -179,6 +179,7 @@ class ContiguousAttentionForwardKernel:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         mma_pv_is_rs: bool = True,
+        is_block_sparse: bool = False,
     ):
         self.dtype = dtype
         hdim_multiple_of = 16
@@ -198,6 +199,7 @@ class ContiguousAttentionForwardKernel:
         self.tile_n = tile_n
         self.num_threads = num_threads
         self.num_stages = num_stages
+        self.is_block_sparse = is_block_sparse
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.qk_acc_dtype = Float32
@@ -575,7 +577,10 @@ class ContiguousAttentionForwardKernel:
         logical_seqlen_k_static: cutlass.Constexpr = 0,
         stream: cuda.CUstream = None,
     ):
-        assert blocksparse_tensors is None
+        if const_expr(blocksparse_tensors is None):
+            mBlockIndices, mBlockOffsets = None, None
+        else:
+            mBlockIndices, mBlockOffsets = blocksparse_tensors
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -759,6 +764,8 @@ class ContiguousAttentionForwardKernel:
             mLSE,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mBlockIndices,
+            mBlockOffsets,
             learnable_sink,
             has_attention_sink_bias,
             tma_atom_Q,
@@ -800,6 +807,8 @@ class ContiguousAttentionForwardKernel:
         mLSE: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
+        mBlockIndices: Optional[cute.Tensor],
+        mBlockOffsets: Optional[cute.Tensor],
         mAttentionSinkBias: cute.Tensor,
         has_attention_sink_bias: cutlass.Constexpr,
         tma_atom_Q: cute.CopyAtom,
@@ -881,6 +890,9 @@ class ContiguousAttentionForwardKernel:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead
             if const_expr(self.pack_gqa)
             else 1,
+            is_block_sparse=self.is_block_sparse,
+            mBlockIndices=mBlockIndices,
+            mBlockOffsets=mBlockOffsets,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,

@@ -10,7 +10,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Int32
+from cutlass import const_expr, Int32
 
 from b12x._lib.program_cache import program_cache
 from b12x._lib.compile_plan import attach_programs
@@ -442,6 +442,9 @@ class VarlenAttentionPlanKey:
     qhead_per_kvhead: int
     logical_q_rows_static: int
     logical_total_q_rows: int
+    block_sparse: bool = False
+    num_q_tiles: int = 0
+    total_blocks_cap: int = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -817,6 +820,7 @@ class _AttentionForwardLaunch:
             pack_gqa=qhead_per_kvhead != 1,
             tile_m=tile_m,
             tile_n=tile_n,
+            is_block_sparse=block_sparse,
         )
         assert head_dim == head_dim_k
 
@@ -897,7 +901,13 @@ class _VarlenAttentionForwardLaunch:
         max_seqlen_k: int,
         tile_m: int,
         tile_n: int,
+        block_sparse: bool = False,
+        num_q_tiles: int = 0,
+        total_blocks_cap: int = 0,
     ):
+        self._block_sparse = bool(block_sparse)
+        self._num_q_tiles = int(num_q_tiles)
+        self._total_blocks_cap = int(total_blocks_cap)
         self._q_shape = q_shape
         self._k_shape = k_shape
         self._v_shape = v_shape
@@ -985,6 +995,8 @@ class _VarlenAttentionForwardLaunch:
         lse_ptr: cute.Pointer,
         cu_seqlens_q_ptr: cute.Pointer,
         cu_seqlens_k_ptr: cute.Pointer,
+        block_indices_ptr: cute.Pointer,
+        block_offsets_ptr: cute.Pointer,
         attention_sink_bias_ptr: cute.Pointer,
         softmax_scale: float,
         q_rows: Int32,
@@ -1025,6 +1037,19 @@ class _VarlenAttentionForwardLaunch:
                 stride=self._cu_seqlens_k_stride,
             ),
         )
+        if const_expr(self._block_sparse):
+            mBlockIndices = cute.make_tensor(
+                block_indices_ptr,
+                layout=cute.make_layout((self._total_blocks_cap,), stride=(1,)),
+            )
+            mBlockOffsets = cute.make_tensor(
+                block_offsets_ptr,
+                layout=cute.make_layout((self._num_q_tiles + 1,), stride=(1,)),
+            )
+            blocksparse_tensors = (mBlockIndices, mBlockOffsets)
+        else:
+            blocksparse_tensors = None
+
         attention_sink_bias_tensor = cute.make_tensor(
             attention_sink_bias_ptr,
             layout=cute.make_layout(
@@ -1041,6 +1066,7 @@ class _VarlenAttentionForwardLaunch:
             softmax_scale,
             mCuSeqlensQ=cu_seqlens_q_tensor,
             mCuSeqlensK=cu_seqlens_k_tensor,
+            blocksparse_tensors=blocksparse_tensors,
             learnable_sink=attention_sink_bias_tensor,
             has_attention_sink_bias=self._has_attention_sink_bias,
             logical_num_batch_static=self._num_batch,
@@ -1129,6 +1155,9 @@ def _compile_varlen_attention(
     max_seqlen_k: int,
     tile_m: int,
     tile_n: int,
+    block_sparse: bool = False,
+    num_q_tiles: int = 0,
+    total_blocks_cap: int = 0,
 ):
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     launch = _VarlenAttentionForwardLaunch(
@@ -1146,6 +1175,9 @@ def _compile_varlen_attention(
         max_seqlen_k=max_seqlen_k,
         tile_m=tile_m,
         tile_n=tile_n,
+        block_sparse=block_sparse,
+        num_q_tiles=num_q_tiles,
+        total_blocks_cap=total_blocks_cap,
     )
     return b12x_compile(
         launch,
@@ -1154,6 +1186,8 @@ def _compile_varlen_attention(
         make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4),
@@ -1180,6 +1214,9 @@ def _compile_varlen_attention(
                 max_seqlen_k,
                 tile_m,
                 tile_n,
+                block_sparse,
+                num_q_tiles,
+                total_blocks_cap,
             ),
         ),
     )
@@ -1265,6 +1302,9 @@ def _get_varlen_attention_plan(
     max_seqlen_k: int,
     tile_m: int,
     tile_n: int,
+    block_sparse: bool = False,
+    num_q_tiles: int = 0,
+    total_blocks_cap: int = 0,
 ) -> VarlenAttentionPlan:
     (
         num_batch,
@@ -1297,6 +1337,9 @@ def _get_varlen_attention_plan(
             tile_n=tile_n,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            block_sparse=block_sparse,
+            num_q_tiles=num_q_tiles,
+            total_blocks_cap=total_blocks_cap,
             num_batch=num_batch,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
@@ -1319,6 +1362,9 @@ def _get_varlen_attention_plan(
             max_seqlen_k,
             tile_m,
             tile_n,
+            block_sparse,
+            num_q_tiles,
+            total_blocks_cap,
         ),
         cutlass_dtype=_torch_to_cutlass_dtype(dtype),
     )
@@ -2199,6 +2245,8 @@ def b12x_varlen_attention_forward(
     causal: bool | None = None,
     window_size: int | tuple[int, int] | None = None,
     attention_sink_bias: torch.Tensor | None = None,
+    block_indices: torch.Tensor | None = None,
+    block_offsets: torch.Tensor | None = None,
     binding: VarlenAttentionBinding | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Execute packed varlen attention from a bound, stored native program."""
@@ -2270,6 +2318,18 @@ def b12x_varlen_attention_forward(
         make_ptr(cutlass.Float32, lse.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cu_seqlens_q.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         make_ptr(cutlass.Int32, cu_seqlens_k.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
+        make_ptr(
+            cutlass.Int32,
+            (cu_seqlens_k if block_indices is None else block_indices).data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
+        make_ptr(
+            cutlass.Int32,
+            (cu_seqlens_k if block_offsets is None else block_offsets).data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        ),
         make_ptr(cutlass.Float32, attention_sink_bias.data_ptr(), cute.AddressSpace.gmem, assumed_align=4),
         float(softmax_scale), Int32(q_shape[0]), Int32(k_shape[0]),
         Int32(cu_q_shape[0] - 1), current_cuda_stream(),
