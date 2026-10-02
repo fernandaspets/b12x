@@ -180,6 +180,7 @@ class ContiguousAttentionForwardKernel:
         has_aux_tensors: bool = False,
         mma_pv_is_rs: bool = True,
         is_block_sparse: bool = False,
+        per_segment_tiles: bool = False,
     ):
         self.dtype = dtype
         hdim_multiple_of = 16
@@ -200,6 +201,7 @@ class ContiguousAttentionForwardKernel:
         self.num_threads = num_threads
         self.num_stages = num_stages
         self.is_block_sparse = is_block_sparse
+        self.per_segment_tiles = per_segment_tiles
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.qk_acc_dtype = Float32
@@ -893,6 +895,7 @@ class ContiguousAttentionForwardKernel:
             is_block_sparse=self.is_block_sparse,
             mBlockIndices=mBlockIndices,
             mBlockOffsets=mBlockOffsets,
+            per_segment_tiles=self.per_segment_tiles,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -1040,7 +1043,7 @@ class ContiguousAttentionForwardKernel:
                 )
             load_Q(tma_bar_ptr=mbar_ptr_Q)
             if const_expr(block_info.is_block_sparse):
-                list_offset, list_count = block_info.n_block_list(m_block)
+                list_offset, list_count = block_info.n_block_list(seqlen, m_block)
                 for list_i in cutlass.range(list_count, unroll=1):
                     list_n_block = block_info.n_block_from_list(list_offset, list_count, list_i)
                     pipeline_k.producer_acquire(kv_producer_state)
@@ -1258,7 +1261,7 @@ class ContiguousAttentionForwardKernel:
             )
 
             if const_expr(block_info.is_block_sparse):
-                list_offset, list_count = block_info.n_block_list(m_block)
+                list_offset, list_count = block_info.n_block_list(seqlen, m_block)
                 for list_i in cutlass.range(list_count, unroll=1):
                     n_block = block_info.n_block_from_list(list_offset, list_count, list_i)
                     kv_consumer_state = self.mma_one_n_block(

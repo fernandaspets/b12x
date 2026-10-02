@@ -443,6 +443,7 @@ class VarlenAttentionPlanKey:
     logical_q_rows_static: int
     logical_total_q_rows: int
     block_sparse: bool = False
+    per_segment_tiles: bool = False
     num_q_tiles: int = 0
     total_blocks_cap: int = 0
 
@@ -903,8 +904,10 @@ class _VarlenAttentionForwardLaunch:
         block_sparse: bool = False,
         num_q_tiles: int = 0,
         total_blocks_cap: int = 0,
+        per_segment_tiles: bool = False,
     ):
         self._block_sparse = bool(block_sparse)
+        self._per_segment_tiles = bool(per_segment_tiles)
         self._num_q_tiles = int(num_q_tiles)
         self._total_blocks_cap = int(total_blocks_cap)
         self._q_shape = q_shape
@@ -982,6 +985,7 @@ class _VarlenAttentionForwardLaunch:
             tile_m=tile_m,
             tile_n=tile_n,
             is_block_sparse=block_sparse,
+            per_segment_tiles=per_segment_tiles,
         )
         assert head_dim == head_dim_k
 
@@ -1158,6 +1162,7 @@ def _compile_varlen_attention(
     block_sparse: bool = False,
     num_q_tiles: int = 0,
     total_blocks_cap: int = 0,
+    per_segment_tiles: bool = False,
 ):
     cutlass_dtype = _torch_to_cutlass_dtype(dtype)
     launch = _VarlenAttentionForwardLaunch(
@@ -1178,6 +1183,7 @@ def _compile_varlen_attention(
         block_sparse=block_sparse,
         num_q_tiles=num_q_tiles,
         total_blocks_cap=total_blocks_cap,
+        per_segment_tiles=per_segment_tiles,
     )
     return b12x_compile(
         launch,
@@ -1217,6 +1223,7 @@ def _compile_varlen_attention(
                 block_sparse,
                 num_q_tiles,
                 total_blocks_cap,
+                per_segment_tiles,
             ),
         ),
     )
@@ -1305,6 +1312,7 @@ def _get_varlen_attention_plan(
     block_sparse: bool = False,
     num_q_tiles: int = 0,
     total_blocks_cap: int = 0,
+    per_segment_tiles: bool = False,
 ) -> VarlenAttentionPlan:
     (
         num_batch,
@@ -1340,6 +1348,7 @@ def _get_varlen_attention_plan(
             block_sparse=block_sparse,
             num_q_tiles=num_q_tiles,
             total_blocks_cap=total_blocks_cap,
+            per_segment_tiles=per_segment_tiles,
             num_batch=num_batch,
             num_q_heads=num_q_heads,
             num_kv_heads=num_kv_heads,
@@ -1365,6 +1374,7 @@ def _get_varlen_attention_plan(
             block_sparse,
             num_q_tiles,
             total_blocks_cap,
+            per_segment_tiles,
         ),
         cutlass_dtype=_torch_to_cutlass_dtype(dtype),
     )

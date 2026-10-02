@@ -49,6 +49,7 @@ def _varlen_payload(query_payload, invocation):
         int(values["window_size_right"]), bool(values["has_attention_sink_bias"]),
         int(values["max_seqlen_q"]), int(values["max_seqlen_k"]),
         bool(values.get("block_sparse", False)),
+        bool(values.get("per_segment_tiles", False)),
     ), contiguous
 
 
@@ -72,12 +73,17 @@ def compile_varlen_attention(query_payload, invocation, config_payload, ordinal)
     config = VarlenAttentionConfig.from_config(FrozenMapping(config_payload))
     TUNING.validate_query(query, None)
     TUNING.validate_config(query, config, None)
-    (*shapes, dtype, causal, left, right, has_sink, max_q, max_k) = values
+    (*shapes, dtype, causal, left, right, has_sink, max_q, max_k, block_sparse,
+     per_segment_tiles) = values
     q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape = shapes
     with torch.cuda.device(ordinal):
         return contiguous._compile_varlen_attention(
             q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape, dtype, causal,
             left, right, has_sink, max_q, max_k, config.tile_m, config.tile_n,
+            block_sparse=bool(block_sparse),
+            num_q_tiles=int(invocation["num_q_tiles"]),
+            total_blocks_cap=int(invocation["total_blocks_cap"]),
+            per_segment_tiles=bool(per_segment_tiles),
         )
 
 
@@ -243,7 +249,8 @@ def _batched_invocation(q, k, v, *, causal, window_size, attention_sink_bias):
 
 
 def _varlen_invocation(q, k, v, cu_seqlens_q, cu_seqlens_k, *, max_seqlen_q, max_seqlen_k,
-                       causal, window_size, attention_sink_bias, block_sparse=False):
+                       causal, window_size, attention_sink_bias, block_sparse=False,
+                       per_segment_tiles=False, num_q_tiles=0, total_blocks_cap=0):
     from b12x.attention._shared.contiguous import api as contiguous
 
     if cu_seqlens_k is None:
@@ -264,6 +271,7 @@ def _varlen_invocation(q, k, v, cu_seqlens_q, cu_seqlens_k, *, max_seqlen_q, max
         q_heads=q_heads, kv_heads=kv_heads, q_head_dim=q_dim, v_head_dim=v_shape[-1],
         query_rows=total_q, kv_rows=total_k, max_seqlen_q=max_q, max_seqlen_k=max_k,
         block_sparse=bool(block_sparse),
+        per_segment_tiles=bool(per_segment_tiles),
     )
     return query, FrozenMapping({
         "q_shape": q_shape, "k_shape": k_shape, "v_shape": v_shape,
@@ -274,6 +282,9 @@ def _varlen_invocation(q, k, v, cu_seqlens_q, cu_seqlens_k, *, max_seqlen_q, max
         "sink_requires_copy": contiguous._attention_sink_requires_copy(sink),
         "max_seqlen_q": max_q, "max_seqlen_k": max_k,
         "block_sparse": bool(block_sparse),
+        "per_segment_tiles": bool(per_segment_tiles),
+        "num_q_tiles": int(num_q_tiles),
+        "total_blocks_cap": int(total_blocks_cap),
     })
 
 
@@ -367,7 +378,8 @@ def plan_batched(q, k, v, *, causal=True, window_size=None, attention_sink_bias=
     )
 def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k,
          causal=False, window_size=None, attention_sink_bias=None, override=None,
-         block_sparse=False, num_q_tiles=0, total_blocks_cap=0):
+         block_sparse=False, num_q_tiles=0, total_blocks_cap=0,
+         per_segment_tiles=False):
     """Prepare row and segment capacities for packed varlen attention.
 
     Bindings may use fewer packed rows or segments than the planning tensors.
@@ -379,12 +391,14 @@ def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k
         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k, causal=causal, window_size=window_size,
         attention_sink_bias=attention_sink_bias, block_sparse=block_sparse,
+        per_segment_tiles=per_segment_tiles, num_q_tiles=num_q_tiles,
+        total_blocks_cap=total_blocks_cap,
     )
 
     def materialize(selection, device):
         _, values, contiguous = _varlen_payload(TUNING.encode_query(replace(query, exhaustive=False)), invocation)
         (*shapes, dtype, selected_causal, left, right, has_sink, max_q, max_k,
-         block_sparse) = values
+         block_sparse, per_segment_tiles) = values
         q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape = shapes
         concrete = contiguous._get_varlen_attention_plan(
             q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape, device.ordinal, dtype,
@@ -393,6 +407,7 @@ def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k
             block_sparse=bool(block_sparse),
             num_q_tiles=int(num_q_tiles),
             total_blocks_cap=int(total_blocks_cap),
+            per_segment_tiles=bool(per_segment_tiles),
         )
         return _VarlenState(
             concrete, contiguous.plan_varlen_attention_scratch(concrete),

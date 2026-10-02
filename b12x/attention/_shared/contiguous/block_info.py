@@ -29,12 +29,24 @@ class BlockInfo:
     is_block_sparse: cutlass.Constexpr[bool] = False
     mBlockIndices: Optional[cute.Tensor] = None
     mBlockOffsets: Optional[cute.Tensor] = None
+    # One CSR per packed segment instead of one for the whole packed batch. The list is
+    # indexed by the GLOBAL q tile of the segment, offset_q // tile_m + m_block, so
+    # segment c reads mBlockOffsets[c_tiles + m_block]. Requires every q offset in
+    # cu_seqlens_q to be a multiple of tile_m (tile-aligned segments), which is what a
+    # per-head packed layout produces. False keeps the shared-list behaviour.
+    per_segment_tiles: cutlass.Constexpr[bool] = False
 
     @cute.jit
-    def n_block_list(self, m_block: Int32) -> Tuple[Int32, Int32]:
-        """(offset, count) of this q tile's K blocks in the CSR list."""
-        begin = self.mBlockOffsets[m_block]
-        end = self.mBlockOffsets[m_block + 1]
+    def n_block_list(self, seqlen_info: SeqlenInfoQK, m_block: Int32) -> Tuple[Int32, Int32]:
+        """(offset, count) of this q tile's K blocks in the CSR list.
+
+        With per_segment_tiles the CSR holds one list per packed segment and is indexed by
+        the global q tile of the segment: offset_q // tile_m + m_block."""
+        tile = m_block
+        if const_expr(self.per_segment_tiles):
+            tile = seqlen_info.offset_q // self.tile_m + m_block
+        begin = self.mBlockOffsets[tile]
+        end = self.mBlockOffsets[tile + 1]
         return begin, end - begin
 
     @cute.jit

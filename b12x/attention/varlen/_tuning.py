@@ -31,6 +31,7 @@ class VarlenAttentionQuery:
     max_seqlen_q: int
     max_seqlen_k: int
     block_sparse: bool = False
+    per_segment_tiles: bool = False
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
 
