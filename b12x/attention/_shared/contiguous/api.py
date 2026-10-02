@@ -820,7 +820,6 @@ class _AttentionForwardLaunch:
             pack_gqa=qhead_per_kvhead != 1,
             tile_m=tile_m,
             tile_n=tile_n,
-            is_block_sparse=block_sparse,
         )
         assert head_dim == head_dim_k
 
@@ -982,6 +981,7 @@ class _VarlenAttentionForwardLaunch:
             pack_gqa=(qhead_per_kvhead != 1 and tile_m % qhead_per_kvhead == 0),
             tile_m=tile_m,
             tile_n=tile_n,
+            is_block_sparse=block_sparse,
         )
         assert head_dim == head_dim_k
 

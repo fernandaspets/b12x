@@ -30,6 +30,7 @@ class VarlenAttentionQuery:
     kv_rows: int
     max_seqlen_q: int
     max_seqlen_k: int
+    block_sparse: bool = False
     exhaustive: bool = field(default_factory=capture_exhaustive_search)
 
 

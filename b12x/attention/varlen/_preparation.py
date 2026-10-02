@@ -48,6 +48,7 @@ def _varlen_payload(query_payload, invocation):
         bool(values["causal"]), int(values["window_size_left"]),
         int(values["window_size_right"]), bool(values["has_attention_sink_bias"]),
         int(values["max_seqlen_q"]), int(values["max_seqlen_k"]),
+        bool(values.get("block_sparse", False)),
     ), contiguous
 
 
@@ -94,6 +95,8 @@ class VarlenBinding:
     binding: object
     sink_source: torch.Tensor | None = None
     sink_storage: torch.Tensor | None = None
+    block_indices: torch.Tensor | None = None
+    block_offsets: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -170,7 +173,8 @@ class _VarlenState:
 
     def bind(self, *, plan: Plan | None = None, scratch, q, k, v, cu_seqlens_q,
              cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None, softmax_scale=None,
-             causal=None, window_size=None, attention_sink_bias=None):
+             causal=None, window_size=None, attention_sink_bias=None,
+             block_indices=None, block_offsets=None):
         sink = self._sink(attention_sink_bias)
         binding = self.scratch_plan.bind(
             scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu_seqlens_q,
@@ -185,13 +189,19 @@ class _VarlenState:
             plan, binding,
             attention_sink_bias if self.sink_storage is not None and attention_sink_bias is not None else None,
             self.sink_storage if attention_sink_bias is not None else None,
+            block_indices,
+            block_offsets,
         )
 
     def run(self, binding):
         if binding.sink_source is not None:
             binding.sink_storage.copy_(binding.sink_source)
         from b12x.attention._shared.contiguous.api import b12x_varlen_attention_forward
-        return b12x_varlen_attention_forward(binding=binding.binding)
+        return b12x_varlen_attention_forward(
+            binding=binding.binding,
+            block_indices=getattr(binding, "block_indices", None),
+            block_offsets=getattr(binding, "block_offsets", None),
+        )
 
 
 def _explicit_max_seqlen(value, *, name: str) -> int:
@@ -233,7 +243,7 @@ def _batched_invocation(q, k, v, *, causal, window_size, attention_sink_bias):
 
 
 def _varlen_invocation(q, k, v, cu_seqlens_q, cu_seqlens_k, *, max_seqlen_q, max_seqlen_k,
-                       causal, window_size, attention_sink_bias):
+                       causal, window_size, attention_sink_bias, block_sparse=False):
     from b12x.attention._shared.contiguous import api as contiguous
 
     if cu_seqlens_k is None:
@@ -253,6 +263,7 @@ def _varlen_invocation(q, k, v, cu_seqlens_q, cu_seqlens_k, *, max_seqlen_q, max
         variant="varlen", dtype=_dtype_name(dtype), causal=bool(causal), batch_size=cu_q_shape[0] - 1,
         q_heads=q_heads, kv_heads=kv_heads, q_head_dim=q_dim, v_head_dim=v_shape[-1],
         query_rows=total_q, kv_rows=total_k, max_seqlen_q=max_q, max_seqlen_k=max_k,
+        block_sparse=bool(block_sparse),
     )
     return query, FrozenMapping({
         "q_shape": q_shape, "k_shape": k_shape, "v_shape": v_shape,
@@ -262,6 +273,7 @@ def _varlen_invocation(q, k, v, cu_seqlens_q, cu_seqlens_k, *, max_seqlen_q, max
         "has_attention_sink_bias": sink is not None,
         "sink_requires_copy": contiguous._attention_sink_requires_copy(sink),
         "max_seqlen_q": max_q, "max_seqlen_k": max_k,
+        "block_sparse": bool(block_sparse),
     })
 
 
@@ -354,7 +366,8 @@ def plan_batched(q, k, v, *, causal=True, window_size=None, attention_sink_bias=
         _materialize=materialize, _device=q.device,
     )
 def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k,
-         causal=False, window_size=None, attention_sink_bias=None, override=None):
+         causal=False, window_size=None, attention_sink_bias=None, override=None,
+         block_sparse=False, num_q_tiles=0, total_blocks_cap=0):
     """Prepare row and segment capacities for packed varlen attention.
 
     Bindings may use fewer packed rows or segments than the planning tensors.
@@ -365,17 +378,21 @@ def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k
     query, invocation = _varlen_invocation(
         q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k, causal=causal, window_size=window_size,
-        attention_sink_bias=attention_sink_bias,
+        attention_sink_bias=attention_sink_bias, block_sparse=block_sparse,
     )
 
     def materialize(selection, device):
         _, values, contiguous = _varlen_payload(TUNING.encode_query(replace(query, exhaustive=False)), invocation)
-        (*shapes, dtype, selected_causal, left, right, has_sink, max_q, max_k) = values
+        (*shapes, dtype, selected_causal, left, right, has_sink, max_q, max_k,
+         block_sparse) = values
         q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape = shapes
         concrete = contiguous._get_varlen_attention_plan(
             q_shape, k_shape, v_shape, cu_q_shape, cu_k_shape, device.ordinal, dtype,
             selected_causal, left, right, has_sink, max_q, max_k,
             selection.config.tile_m, selection.config.tile_n,
+            block_sparse=bool(block_sparse),
+            num_q_tiles=int(num_q_tiles),
+            total_blocks_cap=int(total_blocks_cap),
         )
         return _VarlenState(
             concrete, contiguous.plan_varlen_attention_scratch(concrete),
