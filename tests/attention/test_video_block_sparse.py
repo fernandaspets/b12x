@@ -49,16 +49,13 @@ def _list(S: int, radius: int | None, device):
 
 
 def _mask(S: int, block_indices, block_offsets, device):
-    mask = torch.zeros(S, S, device=device, dtype=torch.bool)
-    for m in range(block_offsets.numel() - 1):
-        rows = torch.arange(m * TILE_M, min((m + 1) * TILE_M, S), device=device)
-        if rows.numel() == 0:
-            continue
-        for b in block_indices[block_offsets[m]:block_offsets[m + 1]].tolist():
-            cols = torch.arange(b * BLOCK_K, min((b + 1) * BLOCK_K, S), device=device)
-            if cols.numel():
-                mask[rows[:, None], cols[None, :]] = True
-    return mask
+    mask = torch.zeros(S, S, dtype=torch.bool)
+    indices, offsets = block_indices.cpu().tolist(), block_offsets.cpu().tolist()
+    for m in range(len(offsets) - 1):
+        for block in indices[offsets[m]:offsets[m + 1]]:
+            mask[m * TILE_M:min((m + 1) * TILE_M, S),
+                 block * BLOCK_K:min((block + 1) * BLOCK_K, S)] = True
+    return mask.to(device)
 
 
 def _oracle(q, k, v, mask):
