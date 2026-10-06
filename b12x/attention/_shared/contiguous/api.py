@@ -973,15 +973,15 @@ class _VarlenAttentionForwardLaunch:
             head_dim,
             head_dim_v=head_dim_v,
             qhead_per_kvhead=qhead_per_kvhead,
-            is_causal=causal,
-            is_local=is_local,
+            is_causal=causal and not block_sparse,
+            is_local=is_local and not block_sparse,
             # Packed GQA folds the group dimension into M.  The resulting
             # layout can only compose with the fixed TMA tile when the group
             # divides tile_m (Laguna uses group=9 with tile_m=128).  Keep the
             # existing unpacked-head kernel as the static fallback for those
             # shapes; this choice depends only on plan geometry and is graph
             # capture safe.
-            pack_gqa=(qhead_per_kvhead != 1 and tile_m % qhead_per_kvhead == 0),
+            pack_gqa=(not block_sparse and qhead_per_kvhead != 1 and tile_m % qhead_per_kvhead == 0),
             tile_m=tile_m,
             tile_n=tile_n,
             is_block_sparse=block_sparse,
@@ -1044,7 +1044,7 @@ class _VarlenAttentionForwardLaunch:
         if const_expr(self._block_sparse):
             mBlockIndices = cute.make_tensor(
                 block_indices_ptr,
-                layout=cute.make_layout((self._total_blocks_cap,), stride=(1,)),
+                layout=cute.make_layout((max(1, self._total_blocks_cap),), stride=(1,)),
             )
             mBlockOffsets = cute.make_tensor(
                 block_offsets_ptr,
@@ -2279,6 +2279,8 @@ def b12x_varlen_attention_forward(
     q, k, v = binding.q, binding.k, binding.v
     cu_seqlens_q, cu_seqlens_k = binding.cu_seqlens_q, binding.cu_seqlens_k
     output, lse, plan = binding.output, binding.lse, binding.plan
+    if plan is not None and plan.block_sparse and (block_indices is None or block_offsets is None):
+        raise ValueError("Sparse attention requires block_indices and block_offsets")
     max_seqlen_q, max_seqlen_k = binding.max_seqlen_q, binding.max_seqlen_k
     softmax_scale, causal, window_size = binding.softmax_scale, binding.causal, binding.window_size
     attention_sink_bias = binding.attention_sink_bias

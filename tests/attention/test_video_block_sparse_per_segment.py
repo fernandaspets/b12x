@@ -45,11 +45,8 @@ def _csr(rows, device):
 def _reference(q, k, v, head, blocks, seq_len, scale):
     rows = (torch.tensor(blocks, device=q.device)[:, None] * BLOCK_K
             + torch.arange(BLOCK_K, device=q.device)).reshape(-1)
-    out = F.scaled_dot_product_attention(
-        q[head].view(1, 1, seq_len, HEAD_DIM),
-        k[head][rows].view(1, 1, -1, HEAD_DIM),
-        v[head][rows].view(1, 1, -1, HEAD_DIM),
-        scale=scale)
+    scores = (q[head].float() @ k[head][rows].float().T) * scale
+    out = (scores.softmax(-1) @ v[head][rows].float()).to(q.dtype)
     return out.view(seq_len, HEAD_DIM)
 
 

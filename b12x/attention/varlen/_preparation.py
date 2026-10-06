@@ -181,6 +181,21 @@ class _VarlenState:
              cu_seqlens_k=None, max_seqlen_q=None, max_seqlen_k=None, softmax_scale=None,
              causal=None, window_size=None, attention_sink_bias=None,
              block_indices=None, block_offsets=None):
+        if self.plan.block_sparse:
+            for name, tensor, capacity in (
+                ("block_indices", block_indices, self.plan.total_blocks_cap),
+                ("block_offsets", block_offsets, self.plan.num_q_tiles + 1),
+            ):
+                if not isinstance(tensor, torch.Tensor):
+                    raise ValueError(f"Sparse attention requires {name}")
+                if (
+                    tensor.dtype != torch.int32 or tensor.device != self.plan.device
+                    or tensor.ndim != 1 or not tensor.is_contiguous()
+                    or tensor.numel() < capacity
+                ):
+                    raise ValueError(
+                        f"{name} must be contiguous CUDA int32 with capacity {capacity}"
+                    )
         sink = self._sink(attention_sink_bias)
         binding = self.scratch_plan.bind(
             scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu_seqlens_q,
@@ -382,6 +397,15 @@ def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k
          per_segment_tiles=False):
     """Prepare row and segment capacities for packed varlen attention.
 
+    Sparse lists use the override's tile sizes, or the default configuration's
+    sizes when no override is supplied. Tuning preserves this CSR geometry.
+    Lists are authoritative; causal and local masks are not reapplied. Offsets
+    must be monotonic, begin at zero, and stay within total_blocks_cap. Listed
+    K block IDs must be valid for each segment using that list. Per-segment
+    lists require every segment's starting Q offset to be tile_m-aligned.
+    Callers producing mutable CSR tensors must preserve these value invariants
+    across replay. Binding validates storage metadata without reading GPU values.
+
     Bindings may use fewer packed rows or segments than the planning tensors.
     Head dimensions, dtype, and contiguous layouts remain fixed. GPU cumulative
     lengths must describe the bound tensors; supplied maximum lengths must not
@@ -394,6 +418,23 @@ def plan(q, k, v, cu_seqlens_q, cu_seqlens_k=None, *, max_seqlen_q, max_seqlen_k
         per_segment_tiles=per_segment_tiles, num_q_tiles=num_q_tiles,
         total_blocks_cap=total_blocks_cap,
     )
+
+    if block_sparse:
+        from ._tuning import _default_config
+
+        config = override if override is not None else _default_config(query, None)
+        if not isinstance(config, VarlenAttentionConfig):
+            config = VarlenAttentionConfig.from_config(FrozenMapping(config))
+        query = replace(query, block_tile_m=config.tile_m, block_tile_n=config.tile_n)
+        TUNING.validate_config(query, config, None)
+        required_tiles = (
+            (query.query_rows + config.tile_m - 1) // config.tile_m
+            if per_segment_tiles else (query.max_seqlen_q + config.tile_m - 1) // config.tile_m
+        )
+        if type(num_q_tiles) is not int or num_q_tiles < max(1, required_tiles):
+            raise ValueError(f"Sparse attention requires at least {max(1, required_tiles)} query tiles")
+        if type(total_blocks_cap) is not int or total_blocks_cap < 0:
+            raise ValueError("Sparse attention block capacity must be a nonnegative integer")
 
     def materialize(selection, device):
         _, values, contiguous = _varlen_payload(TUNING.encode_query(replace(query, exhaustive=False)), invocation)

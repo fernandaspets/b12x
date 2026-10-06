@@ -65,9 +65,9 @@ def _oracle(q, k, v, mask):
     qq = q.transpose(0, 1).unsqueeze(0).float()
     kk = k.transpose(0, 1).unsqueeze(0).float()
     vv = v.transpose(0, 1).unsqueeze(0).float()
-    out = torch.nn.functional.scaled_dot_product_attention(
-        qq, kk, vv, attn_mask=mask.unsqueeze(0).unsqueeze(0)
-    )
+    scores = (qq @ kk.transpose(-1, -2)) * q.shape[-1] ** -0.5
+    scores.masked_fill_(~mask, float("-inf"))
+    out = torch.nan_to_num(scores.softmax(-1)) @ vv
     return out.squeeze(0).transpose(0, 1).to(torch.bfloat16)
 
 
@@ -299,3 +299,145 @@ def test_cuda_graph_capture_and_replay():
     assert torch.equal(captured, reference), (
         f"graph replay differs: max|d|={(captured.float() - reference.float()).abs().max().item()}"
     )
+
+
+def _binding(q, k, v, cu, bi, bo, **kwargs):
+    from b12x.attention import varlen
+    from b12x.attention.varlen import VarlenAttentionConfig
+    from b12x.preparation import require_prepared
+
+    length = int((cu[1:] - cu[:-1]).max())
+    plan = varlen.plan(
+        q, k, v, cu, cu, max_seqlen_q=length, max_seqlen_k=length,
+        block_sparse=True, num_q_tiles=bo.numel() - 1, total_blocks_cap=bi.numel(),
+        override=VarlenAttentionConfig(tile_m=TILE_M, tile_n=BLOCK_K), **kwargs,
+    )
+    state = require_prepared(plan, "attention.varlen", q.device)
+    spec, = state.scratch_plan.scratch_specs()
+    scratch = torch.empty(spec.shape, dtype=spec.dtype, device=q.device)
+    args = dict(scratch=scratch, q=q, k=k, v=v, cu_seqlens_q=cu,
+                cu_seqlens_k=cu, block_indices=bi, block_offsets=bo)
+    return state, state.bind(**args), args
+
+
+@pytest.mark.parametrize("causal,window", [(True, None), (False, (1, 1))])
+def test_sparse_list_is_authoritative_over_causal_and_local_masks(causal, window):
+    device = _require_backend()
+    q, k, v, cu, bi, bo = _case(256, 4, 128, None, device)
+    state, binding, _ = _binding(q, k, v, cu, bi, bo, causal=causal, window_size=window)
+    actual = state.run(binding)[0]
+    expected = _oracle(q, k, v, _mask(256, bi, bo, device))
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
+
+
+def test_sparse_partial_block_masks_nonfinite_values_from_next_segment():
+    device = _require_backend()
+    length = 129
+    q = torch.randn(length * 2, 2, 128, device=device, dtype=torch.bfloat16)
+    k, v = torch.randn_like(q), torch.randn_like(q)
+    v[length:].fill_(float("nan"))
+    cu = torch.tensor([0, length, 2 * length], device=device, dtype=torch.int32)
+    # Reverse traversal visits block zero before the partial block.
+    bi = torch.tensor([2, 0, 2, 0], device=device, dtype=torch.int32)
+    bo = torch.tensor([0, 2, 4], device=device, dtype=torch.int32)
+    state, binding, _ = _binding(q, k, v, cu, bi, bo)
+    actual = state.run(binding)[0][:length]
+    assert torch.isfinite(actual).all()
+    expected = _oracle(q[:length], k[:length], v[:length], _mask(length, bi, bo, device))
+    torch.testing.assert_close(actual, expected, rtol=0.02, atol=0.002)
+
+
+def test_sparse_grouped_query_heads_keep_logical_query_tiles():
+    device = _require_backend()
+    q, k, v, cu, bi, bo = _case(256, 4, 128, 0, device)
+    k, v = k[:, :2].contiguous(), v[:, :2].contiguous()
+    state, binding, _ = _binding(q, k, v, cu, bi, bo)
+    expected = _oracle(q, k.repeat_interleave(2, 1), v.repeat_interleave(2, 1),
+                       _mask(256, bi, bo, device))
+    torch.testing.assert_close(state.run(binding)[0], expected, rtol=0.02, atol=0.002)
+
+
+@pytest.mark.parametrize("field,malformation", [
+    (field, kind) for field in ("block_indices", "block_offsets")
+    for kind in ("missing", "dtype", "device", "short", "strided", "rank")
+])
+def test_sparse_bind_rejects_invalid_csr_storage(field, malformation):
+    device = _require_backend()
+    state, _, args = _binding(*_case(256, 2, 128, None, device))
+    value = args[field]
+    args[field] = {
+        "missing": lambda: None,
+        "dtype": lambda: value.to(torch.int64),
+        "device": lambda: value.cpu(),
+        "short": lambda: value[:-1],
+        "strided": lambda: value.repeat_interleave(2)[::2],
+        "rank": lambda: value.reshape(1, -1),
+    }[malformation]()
+    with pytest.raises(ValueError, match=field):
+        state.bind(**args)
+
+
+def test_sparse_empty_storage():
+    device = _require_backend()
+    q, k, v, cu, _, bo = _case(256, 2, 128, None, device)
+    bi = torch.empty(0, device=device, dtype=torch.int32)
+    bo.zero_()
+    state, binding, _ = _binding(q, k, v, cu, bi, bo)
+    assert not torch.count_nonzero(state.run(binding)[0])
+
+
+def test_sparse_tuning_preserves_csr_geometry():
+    from b12x.attention import varlen
+    from b12x.attention.varlen import VarlenAttentionConfig
+    from b12x.attention.varlen._tuning import TUNING
+
+    device = _require_backend()
+    q, k, v, cu, bi, bo = _case(256, 2, 128, None, device)
+    declaration = varlen.plan(
+        q, k, v, cu, cu, max_seqlen_q=256, max_seqlen_k=256,
+        block_sparse=True, num_q_tiles=bo.numel()-1, total_blocks_cap=bi.numel(),
+    )
+    candidates = [config for _, config in TUNING.eligible_plan(declaration.query, None).candidates]
+    assert candidates == [VarlenAttentionConfig(tile_m=TILE_M, tile_n=BLOCK_K)]
+    with pytest.raises(ValueError, match="CSR block geometry"):
+        TUNING.validate_config(declaration.query, VarlenAttentionConfig(tile_m=64, tile_n=64), None)
+
+
+@pytest.mark.parametrize("tiles,capacity", [(0, 1), (1, 1), (2, -1), (True, 1)])
+def test_sparse_plan_rejects_invalid_capacities(tiles, capacity):
+    from b12x.attention import varlen
+
+    device = _require_backend()
+    q, k, v, cu, _, _ = _case(256, 2, 128, None, device)
+    with pytest.raises(ValueError, match="Sparse attention"):
+        varlen.plan(q, k, v, cu, cu, max_seqlen_q=256, max_seqlen_k=256,
+                    block_sparse=True, num_q_tiles=tiles, total_blocks_cap=capacity)
+
+
+def test_sparse_graph_replay_reads_mutated_lists_without_allocating():
+    from b12x.preparation._measurement import no_compilation
+
+    device = _require_backend()
+    q, k, v, cu, bi, bo = _case(256, 2, 128, 0, device)
+    state, binding, _ = _binding(q, k, v, cu, bi, bo)
+    output = state.run(binding)[0]
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with no_compilation(), torch.cuda.graph(graph):
+        state.run(binding)
+    for block in (1, 3, 0):
+        bi.fill_(block)
+        expected = _oracle(q, k, v, _mask(256, bi, bo, device))
+        output.fill_(float("nan"))
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+        with no_compilation():
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+        torch.testing.assert_close(output, expected, rtol=0.02, atol=0.002)
+    bo.zero_()
+    output.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not torch.count_nonzero(output)
+    graph.reset()

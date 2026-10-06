@@ -1149,7 +1149,7 @@ class ContiguousAttentionForwardKernel:
             smem_thr_copy_V,
             tCcB=thr_mma_pv.partition_B(
                 cute.make_identity_tensor((self.tile_hdimv, self.tile_n))
-            ) if const_expr(is_first_n_block) else None,
+            ) if const_expr(is_first_n_block or self.is_block_sparse) else None,
             valid_k=seqlen.seqlen_k - n_block * self.tile_n,
         )
         pipeline_v.consumer_release(kv_consumer_state)
